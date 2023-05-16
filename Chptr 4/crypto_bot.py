@@ -10,6 +10,7 @@ import os
 import random
 from collections import deque
 from functools import reduce
+
 import imageio
 import numpy as np
 import tensorflow as tf
@@ -19,7 +20,7 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 from crypto_trading_continuous_env import CryptoTradingContinuousEnv
 
-
+tf.keras.backend.set_floatx("float64")
 # In[ ]:
 
 
@@ -42,8 +43,7 @@ def critic(state_shape, action_shape, units=(512, 256,64)):
     state_shape_flattened = functools.reduce(lambda x, y: x * y, state_shape)
     inputs = [Input(shape=state_shape_flattened),Input(shape=action_shape)]
     concat = Concatenate(axis=-1)(inputs)
-    x = Dense(units[0], name="Hidden0",
-    activation="relu")(concat)
+    x = Dense(units[0], name="Hidden0", activation="relu")(concat)
     for index in range(1, len(units)):
         x = Dense(units[index],name="Hidden{}".format(index), activation="relu")(x)
     output = Dense(1, name="Out_QVal")(x)
@@ -57,8 +57,7 @@ def critic(state_shape, action_shape, units=(512, 256,64)):
 def update_target_weights(model, target_model,tau=0.005):
     weights = model.get_weights()
     target_weights = target_model.get_weights()
-    for i in range(len(target_weights)): # set tau% of
-        # target model to be new weights
+    for i in range(len(target_weights)): # set tau% of target model to be new weights
         target_weights[i] = weights[i] * tau + target_weights[i] * (1 - tau)
     target_model.set_weights(target_weights)
 
@@ -68,7 +67,8 @@ def update_target_weights(model, target_model,tau=0.005):
 
 class SAC(object):
     def __init__(
-        self,env,
+        self,
+        env,
         lr_actor=3e-5,
         lr_critic=3e-4,
         actor_units=(64, 64),
@@ -81,10 +81,8 @@ class SAC(object):
         memory_cap=100000,
     ):
         self.env = env
-        self.state_shape = env.observation_space.shape
-        # shape of observations
-        self.action_shape = env.action_space.shape
-        # number of actions
+        self.state_shape = env.observation_space.shape # shape of observations
+        self.action_shape = env.action_space.shape # number of actions
         self.action_bound = (env.action_space.high - env.action_space.low) / 2
         self.action_shift = (env.action_space.high + env.action_space.low) / 2
         self.memory = deque(maxlen=int(memory_cap))
@@ -97,16 +95,20 @@ class SAC(object):
         self.log_std_max = 2
         print(self.actor.summary())
         
+        # Define and initialize critic networks
         self.critic_1 = critic(self.state_shape,self.action_shape, critic_units)
         self.critic_target_1 = critic(self.state_shape,self.action_shape, critic_units)
         self.critic_optimizer_1 = Adam(learning_rate=lr_critic)
         update_target_weights(self.critic_1, self.critic_target_1, tau=1.0)
+
         self.critic_2 = critic(self.state_shape, self.action_shape, critic_units)
         self.critic_target_2 = critic(self.state_shape,self.action_shape, critic_units)
         self.critic_optimizer_2 = Adam(learning_rate=lr_critic)
         update_target_weights(self.critic_2, self.critic_target_2, tau=1.0)
+
         print(self.critic_1.summary())
         
+        # Define and initialize temperature alpha and target entropy
         self.auto_alpha = auto_alpha
         if auto_alpha:
             self.target_entropy = -np.prod(self.action_shape)
@@ -126,6 +128,7 @@ class SAC(object):
         raw_actions = mean
         if not test:
             raw_actions += tf.random.normal(shape=mean.shape, dtype=tf.float64) * std
+
         log_prob_u = tfp.distributions.Normal(loc=mean,scale=std).log_prob(raw_actions)
         actions = tf.math.tanh(raw_actions)
         log_prob = tf.reduce_sum(log_prob_u - tf.math.log(1 - actions ** 2 + eps))
@@ -151,6 +154,7 @@ class SAC(object):
         q2 = self.critic_2.predict([state, a])[0][0]
         self.summaries["q_min"] = tf.math.minimum(q1, q2)
         self.summaries["q_mean"] = np.mean([q1, q2])
+
         return a
         
     def remember(self, state, action, reward, next_state, done):
@@ -166,13 +170,17 @@ class SAC(object):
             return
         samples = random.sample(self.memory, self.batch_size)
         s = np.array(samples).T
-        states, actions, rewards, next_states, dones = [np.vstack(s[i, :]).astype(np.float) for i in range(5)]
+        states, actions, rewards, next_states, dones = [
+            np.vstack(s[i, :]).astype(np.float) for i in range(5)
+        ]
 
         with tf.GradientTape(persistent=True) as tape:
             # next state action log probs
             means, log_stds = self.actor(next_states)
             log_stds = tf.clip_by_value(log_stds, self.log_std_min, self.log_std_max)
             next_actions, log_probs = self.process_actions(means, log_stds)
+
+            # critics loss
             current_q_1 = self.critic_1([states, actions])
             current_q_2 = self.critic_2([states, actions])
             next_q_1 = self.critic_target_1([next_states, next_actions])
@@ -183,17 +191,26 @@ class SAC(object):
             target_qs = tf.stop_gradient(rewards + state_values * self.gamma * (1.0 - dones))
             critic_loss_1 = tf.reduce_mean(0.5 * tf.math.square(current_q_1 - target_qs))
             critic_loss_2 = tf.reduce_mean(0.5 * tf.math.square(current_q_2 - target_qs))
+            
+            # current state action log probs
             means, log_stds = self.actor(states)
             log_stds = tf.clip_by_value(log_stds, self.log_std_min, self.log_std_max)
             actions, log_probs = self.process_actions(means, log_stds)
+
+            # actor loss
             current_q_1 = self.critic_1([states, actions])
             current_q_2 = self.critic_2([states, actions])
             current_q_min = tf.math.minimum(current_q_1, current_q_2)
             actor_loss = tf.reduce_mean(self.alpha * log_probs - current_q_min)
+
+            # temperature loss
             if self.auto_alpha:
-                alpha_loss = -tf.reduce_mean((self.log_alpha * tf.stop_gradient(log_probs + self.target_entropy)))
+                alpha_loss = -tf.reduce_mean(
+                    (self.log_alpha * tf.stop_gradient(log_probs + self.target_entropy))
+                )
 
         critic_grad = tape.gradient(critic_loss_1, self.critic_1.trainable_variables)
+        # compute actor gradient
         self.critic_optimizer_1.apply_gradients(zip(critic_grad,self.critic_1.trainable_variables))
 
         critic_grad = tape.gradient(
@@ -215,6 +232,7 @@ class SAC(object):
         self.summaries["q1_loss"] = critic_loss_1
         self.summaries["q2_loss"] = critic_loss_2
         self.summaries["actor_loss"] = actor_loss
+
         if self.auto_alpha:
             # optimize temperature
             alpha_grad = tape.gradient(alpha_loss, [self.log_alpha])
@@ -227,12 +245,14 @@ class SAC(object):
         current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         train_log_dir = os.path.join("logs","TFRL-Cookbook-Ch4-SAC", current_time)
         summary_writer = tf.summary.create_file_writer(train_log_dir)
+
         done, use_random, episode, steps, epoch, episode_reward = (False, True, 0, 0, 0, 0,)
         cur_state = self.env.reset()
         
         while epoch < max_epochs:
             if steps > max_steps:
                 done = True
+
             if done:
                 episode += 1
                 print("episode {}: {} total reward, {} alpha, {} steps, {} epochs".format(episode, episode_reward, self.alpha.numpy(), steps, epoch))
@@ -244,6 +264,7 @@ class SAC(object):
                         "Main/episode_steps", steps, step=episode
                     )
                 summary_writer.flush()
+
                 done, cur_state, steps, episode_reward =False, self.env.reset(), 0, 0
                 if episode % save_freq == 0:
                     self.save_model(
@@ -252,8 +273,10 @@ class SAC(object):
                     )
                 if epoch > random_epochs and len(self.memory) > self.batch_size:
                     use_random = False
+
                 action = self.act(cur_state, use_random=use_random) # determine action
                 next_state, reward, done, _ = self.env.step(action[0]) # act on env self.env.render(mode='rgb_array')
+                
                 self.remember(cur_state, action, reward, next_state, done) #add to memory
                 self.replay() # train models through memory
                 # replay
@@ -265,7 +288,7 @@ class SAC(object):
                 # iterates target model
                 update_target_weights(
                     self.critic_2,
-                    elf.critic_target_2,
+                    self.critic_target_2,
                     tau=self.tau)
                 cur_state = next_state
                 episode_reward += reward
@@ -307,6 +330,7 @@ class SAC(object):
             "sac_actor_final_episode{}.h5".format(episode),
             "sac_critic_final_episode{}.h5".format(episode),
         )
+
     def save_model(self, a_fn, c_fn):
         self.actor.save(a_fn)
         self.critic_1.save(c_fn)
